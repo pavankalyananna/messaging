@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.7.2/font/bootstrap-icons.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1.6.1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+</head>
+<body>
+    <nav class="navbar navbar-dark bg-dark">
+        <div class="container">
+            <span class="navbar-brand">Admin Panel</span>
+            <div class="navbar-text">
+                Status: <span id="status" class="badge bg-secondary">Offline</span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container mt-4">
+        <div class="row">
+            <div class="col-md-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Controls</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="d-grid gap-2">
+                            <button id="onlineBtn" class="btn btn-success">Go Online</button>
+                            <button id="offlineBtn" class="btn btn-secondary">Go Offline</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mt-3">
+                    <div class="card-header">
+                        <h5>Incoming Calls</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="callsList"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="col-md-8">
+                <div class="card">
+                    <div class="card-header">
+                        <h5>Active Call</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="noCall" class="text-center text-muted">
+                            <p>No active call</p>
+                        </div>
+                        <div id="activeCall" class="hidden">
+                            <p>Call with: <span id="callerName"></span></p>
+                            <audio id="remoteAudio" autoplay controls class="w-100"></audio>
+                            <button id="endCallBtn" class="btn btn-danger mt-2">End Call</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const config = {
+            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        };
+
+        let peerConnection = null;
+        let localStream = null;
+        let stompClient = null;
+        let currentCaller = null;
+
+        // WebSocket connection
+        function initWebSocket() {
+            const socket = new SockJS('/ws');
+            stompClient = Stomp.over(socket);
+            
+            stompClient.connect({}, function(frame) {
+                console.log('Admin WebSocket connected');
+                
+                // Subscribe to calls
+                stompClient.subscribe('/topic/admin/calls', function(message) {
+                    const data = JSON.parse(message.body);
+                    showIncomingCall(data.from, data.requestId);
+                });
+                
+                // Subscribe to signals
+                stompClient.subscribe('/topic/admin/signals', function(message) {
+                    const signal = JSON.parse(message.body);
+                    handleSignal(signal);
+                });
+                
+            });
+        }
+
+        function setOnline() {
+            if (stompClient) {
+                stompClient.send("/app/admin.presence", {}, JSON.stringify({ type: 'ADMIN_ONLINE' }));
+                document.getElementById('status').textContent = 'Online';
+                document.getElementById('status').className = 'badge bg-success';
+            }
+        }
+
+        function setOffline() {
+            if (stompClient) {
+                stompClient.send("/app/admin.presence", {}, JSON.stringify({ type: 'ADMIN_OFFLINE' }));
+                document.getElementById('status').textContent = 'Offline';
+                document.getElementById('status').className = 'badge bg-secondary';
+            }
+        }
+
+        function showIncomingCall(callerName, requestId) {
+            const callsList = document.getElementById('callsList');
+            const callItem = document.createElement('div');
+            callItem.className = 'alert alert-info';
+            callItem.innerHTML = `
+                <p><strong>${callerName}</strong> is calling</p>
+                <button onclick="acceptCall('${callerName}', '${requestId}')" class="btn btn-success btn-sm">Accept</button>
+                <button onclick="declineCall('${requestId}')" class="btn btn-danger btn-sm">Decline</button>
+            `;
+            callsList.appendChild(callItem);
+        }
+
+        async function acceptCall(callerName, requestId) {
+            currentCaller = callerName;
+            
+            try {
+                // Clear calls list
+                document.getElementById('callsList').innerHTML = '';
+                
+                // Show active call
+                document.getElementById('noCall').classList.add('hidden');
+                document.getElementById('activeCall').classList.remove('hidden');
+                document.getElementById('callerName').textContent = callerName;
+                
+                // Get user media
+                localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                
+                // Create peer connection
+                peerConnection = new RTCPeerConnection(config);
+                
+                // Add local stream
+                localStream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, localStream);
+                });
+
+                // Handle incoming stream
+                peerConnection.ontrack = (event) => {
+                    const audio = document.getElementById('remoteAudio');
+                    audio.srcObject = event.streams[0];
+                };
+
+                // Handle ICE candidates
+                peerConnection.onicecandidate = (event) => {
+                    if (event.candidate && stompClient) {
+                        stompClient.send("/app/call.signal", {}, JSON.stringify({
+                            to: requestId,
+                            type: 'ice_candidate',
+                            candidate: event.candidate
+                        }));
+                    }
+                };
+
+                // Subscribe to visitor signals
+                stompClient.subscribe('/topic/admin/signals', function(message) {
+                    const signal = JSON.parse(message.body);
+                    if (signal.type === 'offer') {
+                        handleOffer(signal.offer, requestId);
+                    } else if (signal.type === 'ice_candidate') {
+                        handleIceCandidate(signal.candidate);
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error accepting call:', error);
+                alert('Error starting call');
+            }
+        }
+
+        async function handleOffer(offer, requestId) {
+            if (!peerConnection) return;
+            
+            try {
+                await peerConnection.setRemoteDescription(offer);
+                const answer = await peerConnection.createAnswer();
+                await peerConnection.setLocalDescription(answer);
+                
+                if (stompClient) {
+                    stompClient.send("/app/call.signal", {}, JSON.stringify({
+                        to: requestId,
+                        type: 'answer',
+                        answer: answer
+                    }));
+                }
+            } catch (error) {
+                console.error('Error handling offer:', error);
+            }
+        }
+
+        async function handleIceCandidate(candidate) {
+            if (!peerConnection) return;
+            
+            try {
+                await peerConnection.addIceCandidate(candidate);
+            } catch (error) {
+                console.error('Error adding ICE candidate:', error);
+            }
+        }
+
+        function handleSignal(signal) {
+            if (signal.type === 'offer') {
+                handleOffer(signal.offer, signal.from);
+            } else if (signal.type === 'ice_candidate') {
+                handleIceCandidate(signal.candidate);
+            }
+        }
+
+        function declineCall(requestId) {
+            // Remove from calls list
+            document.getElementById('callsList').innerHTML = '';
+        }
+
+        function endCall() {
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+            
+            document.getElementById('activeCall').classList.add('hidden');
+            document.getElementById('noCall').classList.remove('hidden');
+            currentCaller = null;
+        }
+
+        // Event listeners
+        document.getElementById('onlineBtn').addEventListener('click', setOnline);
+        document.getElementById('offlineBtn').addEventListener('click', setOffline);
+        document.getElementById('endCallBtn').addEventListener('click', endCall);
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            initWebSocket();
+            setOnline(); // Auto set online when page loads
+        });
+
+        // Make functions global for onclick handlers
+        window.acceptCall = acceptCall;
+        window.declineCall = declineCall;
+    </script>
+</body>
+</html>
